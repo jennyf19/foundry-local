@@ -1,0 +1,89 @@
+name: Branch C++ validation
+
+on:
+  push:
+    branches:
+      - feature/chat-template-kwargs-baiju-validation
+
+env:
+  ORT_BUILD_VERSION: "1.26.0"
+  ORT_RUNTIME_VERSION: "1.28.0"
+  ORT_BUILD_SOURCE: "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Nightly/nuget/v3/index.json"
+  ORT_RUNTIME_SOURCE: "https://api.nuget.org/v3/index.json"
+  ORT_PACKAGE_NAME: "Microsoft.ML.OnnxRuntime"
+
+jobs:
+  cpp-tests:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: stable
+            genai_version: "0.15.2"
+            genai_url: "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntimegenai.foundry/0.15.2/microsoft.ml.onnxruntimegenai.foundry.0.15.2.nupkg"
+            kwargs_enabled: "0"
+          - name: nightly
+            genai_version: "0.16.0-dev1001407373"
+            genai_url: "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Nightly/nuget/v3/flat2/microsoft.ml.onnxruntimegenai.foundry/0.16.0-dev1001407373/microsoft.ml.onnxruntimegenai.foundry.0.16.0-dev1001407373.nupkg"
+            kwargs_enabled: "1"
+    name: cpp-tests-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Download ONNX Runtime
+        working-directory: sdk_v2/cpp
+        run: |
+          dotnet new console
+          dotnet add package "$ORT_PACKAGE_NAME" --version "$ORT_BUILD_VERSION" --source "$ORT_BUILD_SOURCE" --package-directory .
+          dotnet add package "$ORT_PACKAGE_NAME" --version "$ORT_RUNTIME_VERSION" --source "$ORT_RUNTIME_SOURCE" --package-directory .
+          mkdir -p ort-build/lib ort/lib
+          mv "microsoft.ml.onnxruntime/$ORT_BUILD_VERSION/build/native/include" ort-build/
+          mv "microsoft.ml.onnxruntime/$ORT_BUILD_VERSION/runtimes/linux-x64/native/"* ort-build/lib/
+          mv "microsoft.ml.onnxruntime/$ORT_RUNTIME_VERSION/runtimes/linux-x64/native/"* ort/lib/
+          cp ort-build/lib/libonnxruntime.so ort-build/lib/libonnxruntime.so.1
+          cp ort/lib/libonnxruntime.so ort/lib/libonnxruntime.so.1
+      - name: Download ORT GenAI Foundry package
+        working-directory: sdk_v2/cpp
+        env:
+          ORT_GENAI_PACKAGE_URL: ${{ matrix.genai_url }}
+        run: curl --fail --location "$ORT_GENAI_PACKAGE_URL" --output genai.nupkg
+      - name: Set up vcpkg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git vcpkg
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+      - name: Build Foundry Local tests
+        run: |
+          python sdk_v2/cpp/build.py \
+            --config Release \
+            --cmake_generator Ninja \
+            --vcpkg_root "$GITHUB_WORKSPACE/vcpkg" \
+            --ort_home "$GITHUB_WORKSPACE/sdk_v2/cpp/ort-build" \
+            --cmake_extra_defines \
+              "ORT_GENAI_VERSION=${{ matrix.genai_version }}" \
+              "GENAI_FETCH_URL=$GITHUB_WORKSPACE/sdk_v2/cpp/genai.nupkg" \
+              "FOUNDRY_LOCAL_REQUIRE_CHAT_TEMPLATE_KWARGS=${{ matrix.kwargs_enabled }}" \
+            --skip_examples \
+            --skip_service \
+            --configure \
+            --build \
+            --skip_tests \
+            --parallel
+      - name: Verify capability gate
+        run: |
+          grep -q \
+            "FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS=${{ matrix.kwargs_enabled }}" \
+            sdk_v2/cpp/build/Linux/Release/build.ninja
+      - name: Run self-contained Foundry tests
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/sdk_v2/cpp/ort/lib:${{ github.workspace }}/sdk_v2/cpp/build/Linux/Release/_deps/genailib-src/runtimes/linux-x64/native
+        run: |
+          sdk_v2/cpp/build/Linux/Release/bin/foundry_local_tests \
+            --gtest_filter='ChatCompletionRequestTest.*:ChatCompletionsConverterTest.*:ChatSessionDecisionTest.*:ChatTemplateUnitTest.*'
