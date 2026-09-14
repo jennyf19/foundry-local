@@ -4,14 +4,18 @@
 // Validates message formatting, template application, and token encoding.
 
 #include "inferencing/generative/chat/chat_template.h"
+#include "inferencing/generative/chat/chat_session.h"
 #include "exception.h"
 #include "inferencing/generative/toolcalling/tool_call_context.h"
 #include "inferencing/model_load_manager.h"
 #include "ep_detection/ep_detector.h"
 #include "logger.h"
+#include "model.h"
+#include "items/text_item.h"
 #include "internal_api/test_helpers.h"
 #include "internal_api/test_model_cache.h"
 #include "utils/temp_path.h"
+#include "telemetry/telemetry_logger.h"
 
 #include <ort_genai.h>
 #include <gtest/gtest.h>
@@ -111,6 +115,29 @@ class ChatTemplateKwargsTest : public ::testing::Test {
   test::CpuOnlyEpDetector ep_detector_;
   ModelLoadManager load_manager_{ep_detector_, logger_};
   GenAIModelInstance* model_ = nullptr;
+
+  const Model& GetCatalogModel() {
+    static test::FakeServiceBindings services;
+    static Model model = [] {
+      ModelInfo info;
+      info.task = "chat-completion";
+      return Model::FromModelInfo(std::move(info), "", services.download_manager, services.model_load_manager);
+    }();
+    return model;
+  }
+
+  void SetSessionDefaults(ChatSession& session, const char* kwargs) {
+    KeyValuePairs options;
+    options.Add("max_output_tokens", "4");
+    options.Add("temperature", "0");
+    if (kwargs) {
+      options.Add("chat_template_kwargs", kwargs);
+    }
+
+    session.SetSessionOptions(options);
+  }
+
+  TelemetryLogger telemetry_{"chat-template-kwargs-test", test::NullLog()};
 };
 #endif
 
@@ -203,6 +230,88 @@ TEST_F(ChatTemplateKwargsTest, TypedKwargsChangePromptAndOmissionClearsPriorStat
   EXPECT_EQ(default_prompt_after_kwargs, default_prompt)
       << "Omitting kwargs must clear tokenizer state from the previous render";
 }
+
+TEST_F(ChatTemplateKwargsTest, SessionDefaultsAreOverriddenOrClearedByRequestOptions) {
+  struct Case {
+    const char* defaults;
+    const char* request;
+    const char* prefix;
+  };
+  const Case cases[] = {
+      {R"({"enable_thinking":false})", nullptr, "[no-thinking]"},
+      {R"({"enable_thinking":false})", R"({"enable_thinking":true})", "[thinking]"},
+      {R"({"enable_thinking":true})", "{}", "[default]"},
+      {R"({"enable_thinking":true})", "", "[default]"},
+      {R"({"enable_thinking":true,"label":"inherited"})", R"({"enable_thinking":false})", "[no-thinking]"},
+      {nullptr, nullptr, "[default]"},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.prefix);
+    ChatSession session(GetCatalogModel(), GetModel(), logger_, telemetry_);
+    SetSessionDefaults(session, test_case.defaults);
+
+    Request request;
+    request.AddOwnedItem(std::make_unique<MessageItem>(FOUNDRY_LOCAL_ROLE_USER, "Hello!"));
+    if (test_case.request) {
+      request.options.Add("chat_template_kwargs", test_case.request);
+    }
+
+    Response response;
+    session.ProcessRequest(request, response);
+    ASSERT_EQ(response.finish_reason, FOUNDRY_LOCAL_FINISH_LENGTH);
+    const std::string expected_prompt = std::string(test_case.prefix) + "[user]Hello![assistant]";
+    EXPECT_EQ(response.usage.prompt_tokens, static_cast<int64_t>(expected_prompt.size()));
+  }
+}
+
+TEST_F(ChatTemplateKwargsTest, JsonPayloadOverridesRequestOptionsThenSessionDefaults) {
+  struct Case {
+    const char* defaults;
+    const char* request;
+    const char* payload;
+    const char* prefix;
+  };
+  const Case cases[] = {
+      {R"({"enable_thinking":false})", nullptr, nullptr, "[no-thinking]"},
+      {R"({"enable_thinking":false})", R"({"enable_thinking":true})", nullptr, "[thinking]"},
+      {R"({"enable_thinking":true})", R"({"enable_thinking":true})", R"({"enable_thinking":false})", "[no-thinking]"},
+      {R"({"enable_thinking":false})", R"({"enable_thinking":true})", "{}", "[default]"},
+      {R"({"enable_thinking":false})", nullptr, "null", "[no-thinking]"},
+      {R"({"enable_thinking":true})", "{}", nullptr, "[default]"},
+      {nullptr, nullptr, nullptr, "[default]"},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.prefix);
+    ChatSession session(GetCatalogModel(), GetModel(), logger_, telemetry_);
+    SetSessionDefaults(session, test_case.defaults);
+
+    nlohmann::json payload = {
+        {"model", "chat-template-kwargs"},
+        {"messages", {{{"role", "user"}, {"content", "Hello!"}}}},
+    };
+    if (test_case.payload) {
+      payload["chat_template_kwargs"] = nlohmann::json::parse(test_case.payload);
+    }
+
+    Request request;
+    request.AddOwnedItem(std::make_unique<TextItem>(payload.dump(), FOUNDRY_LOCAL_TEXT_ITEM_TYPE_OPENAI_JSON));
+    if (test_case.request) {
+      request.options.Add("chat_template_kwargs", test_case.request);
+    }
+
+    Response response;
+    session.ProcessRequest(request, response);
+    ASSERT_EQ(response.finish_reason, FOUNDRY_LOCAL_FINISH_LENGTH);
+    const std::string expected_prompt = std::string(test_case.prefix) + "[user]Hello![assistant]";
+    EXPECT_EQ(response.usage.prompt_tokens, static_cast<int64_t>(expected_prompt.size()));
+    ASSERT_EQ(response.items.size(), 1u);
+    ASSERT_EQ(response.items.front()->type, FOUNDRY_LOCAL_ITEM_TEXT);
+    const auto& text = static_cast<const TextItem&>(*response.items.front());
+    const auto completion = nlohmann::json::parse(text.text);
+    EXPECT_EQ(completion.at("usage").at("prompt_tokens"), expected_prompt.size());
+    EXPECT_EQ(session.TurnCount(), 0u);
+  }
+}
 #else
 TEST_F(ChatTemplateTest, TemplateKwargsRequireSupportedGenAI) {
   std::vector<TranscriptMessage> messages = {{FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
@@ -218,7 +327,7 @@ TEST_F(ChatTemplateTest, TemplateKwargsRequireSupportedGenAI) {
     FAIL() << "Expected chat_template_kwargs to be rejected by an older GenAI dependency";
   } catch (const fl::Exception& e) {
     EXPECT_EQ(e.code(), FOUNDRY_LOCAL_ERROR_INVALID_USAGE);
-    EXPECT_NE(std::string(e.what()).find("requires a newer ONNX Runtime GenAI package"),
+    EXPECT_NE(std::string(e.what()).find("requires a build with tokenizer kwargs support enabled"),
               std::string::npos);
   }
 }

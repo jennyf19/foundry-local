@@ -112,26 +112,7 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(OnnxRuntimeGenAI REQUIRED)
 
-# UpdateOptions exists in older headers too; kwargs support depends on the bundled tokenizer, not a new C++ symbol.
-set(FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS OFF)
-if(ORT_GENAI_VERSION MATCHES "^0\\.16\\.0-dev([0-9]+)$")
-    if(CMAKE_MATCH_1 GREATER_EQUAL 1001407373)
-        set(FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS ON)
-    endif()
-elseif(ORT_GENAI_VERSION AND NOT ORT_GENAI_VERSION VERSION_LESS "0.16.0")
-    set(FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS ON)
-endif()
-
-if(FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS)
-    message(STATUS "ORT GenAI chat template kwargs: enabled")
-else()
-    message(STATUS "ORT GenAI chat template kwargs: unavailable")
-endif()
-if(FOUNDRY_LOCAL_REQUIRE_CHAT_TEMPLATE_KWARGS AND
-   NOT FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS)
-    message(FATAL_ERROR
-        "The selected ORT GenAI package does not support required chat template kwargs")
-endif()
+include(cmake/chat-template-kwargs.cmake)
 find_package(OnnxRuntime REQUIRED)
 
 # WinML EP Catalog — Windows-only, for hardware EP discovery and download. The

@@ -762,6 +762,45 @@ TEST_F(ChatSessionTest, ChatTemplateKwargsControlCachedGeneratorReuse) {
   EXPECT_EQ(replayed_removed_kwargs.prompt_tokens, removed_kwargs_full_history.prompt_tokens);
 }
 
+TEST_F(ChatSessionTest, SessionTemplateDefaultsInvalidateOnlyWhenEffectiveKwargsChange) {
+  constexpr const char* kThinking = R"({"enable_thinking":true})";
+  constexpr const char* kNoThinking = R"({"enable_thinking":false})";
+  ChatSession session(GetCatalogModel(), GetModel(), *logger_, null_telemetry_);
+  KeyValuePairs defaults;
+  defaults.Add("chat_template_kwargs", kNoThinking);
+  session.SetSessionOptions(defaults);
+
+  auto run_turn = [&](const char* prompt, const char* kwargs = nullptr) {
+    Request request;
+    request.AddOwnedItem(MakeMessage(FOUNDRY_LOCAL_ROLE_USER, prompt));
+    request.options.Add("max_output_tokens", "32");
+    request.options.Add("temperature", "0");
+    if (kwargs) {
+      request.options.Add("chat_template_kwargs", kwargs);
+    }
+
+    Response response;
+    session.ProcessRequest(request, response);
+    EXPECT_EQ(response.finish_reason, FOUNDRY_LOCAL_FINISH_STOP);
+    return session.Transcript().Turns().back().tokens.pre_turn.has_value();
+  };
+
+  EXPECT_FALSE(run_turn("Reply briefly: one."));
+  EXPECT_TRUE(run_turn("Reply briefly: two.", kNoThinking))
+      << "Explicitly repeating the inherited default must not rebuild the generator";
+
+  defaults.Add("chat_template_kwargs", kThinking);
+  session.SetSessionOptions(defaults);
+  EXPECT_TRUE(run_turn("Reply briefly: three.", kNoThinking))
+      << "A request override keeps the effective kwargs unchanged when the session default changes";
+  EXPECT_FALSE(run_turn("Reply briefly: four."))
+      << "Using a changed session default must rebuild without a stale rewind boundary";
+
+  session.SetSessionOptions({});
+  EXPECT_FALSE(run_turn("Reply briefly: five."))
+      << "Removing the session default must invalidate retained template state";
+}
+
 TEST_F(ChatSessionTest, ChatTemplateKwargsCancellationReplaysFullHistory) {
   struct TurnResult {
     std::string text;

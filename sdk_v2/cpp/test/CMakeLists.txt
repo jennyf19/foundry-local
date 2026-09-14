@@ -2,6 +2,9 @@
 
 find_package(httplib CONFIG REQUIRED)
 
+add_test(NAME ChatTemplateKwargsConfiguration
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/chat-template-kwargs-test.cmake)
+
 # cpp-httplib's non-blocking resolver uses getaddrinfo_a, which lives in libanl on glibc < 2.34.
 set(FOUNDRY_LOCAL_HTTPLIB_LIBS httplib::httplib)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

@@ -89,7 +89,7 @@ std::string Preprocessor::ApplyChatTemplateWithOptions(const char* messages_json
     }
     if (!template_kwargs.empty()) {
       FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_USAGE,
-               "chat_template_kwargs requires a newer ONNX Runtime GenAI package");
+               "chat_template_kwargs requires a build with tokenizer kwargs support enabled");
     }
   }
 #endif
