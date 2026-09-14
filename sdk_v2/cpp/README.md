@@ -33,6 +33,15 @@ wrapper need only C++17 or newer.
 The build resolves its C++ dependencies from the manifest in `vcpkg.json`, and obtains
 the pinned ONNX Runtime and ONNX Runtime GenAI dependencies during CMake configuration.
 
+Chat completions accept a typed `chat_template_kwargs` JSON object, such as
+`{"enable_thinking": false}`, for model-specific template controls. The pinned stable
+GenAI package supports this feature; a nightly package is not required. The
+`FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS` compile-time guard disables tokenizer
+updates for packages without support and rejects non-empty kwargs explicitly rather
+than ignoring them. Omitted or empty kwargs retain ordinary chat behavior. Builds that
+must provide the feature can pass
+`--cmake_extra_defines FOUNDRY_LOCAL_REQUIRE_CHAT_TEMPLATE_KWARGS=ON` to `build.py`.
+
 ## Build From Source
 
 From this directory:

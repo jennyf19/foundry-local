@@ -11,20 +11,18 @@
 #include "logger.h"
 #include "internal_api/test_helpers.h"
 #include "internal_api/test_model_cache.h"
+#include "utils/temp_path.h"
 
 #include <ort_genai.h>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 
 using namespace fl;
-
-namespace {
-#if FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS
-constexpr const char* kTestChatTemplateKwargsModelAlias = "qwen3.5-0.8b-generic-cpu-2";
-#endif
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // Test fixture: loads the shared test model once per suite
@@ -69,36 +67,50 @@ class ChatTemplateTest : public ::testing::Test {
 #if FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS
 class ChatTemplateKwargsTest : public ::testing::Test {
  protected:
-  static void SetUpTestSuite() {
-    auto model_path = fl::test::GetTestModelPath(kTestChatTemplateKwargsModelAlias);
-    logger_ = std::make_unique<StderrLogger>();
-    ep_detector_ = std::make_unique<test::CpuOnlyEpDetector>();
-    load_manager_ = std::make_unique<ModelLoadManager>(*ep_detector_, *logger_);
+  void SetUp() override {
+    const auto source = test::GetTestDataPath("tiny-paged-attention");
+    for (const auto* file : {"genai_config.json", "decoder.onnx", "tokenizer.json", "tokenizer_config.json"}) {
+      std::filesystem::copy_file(source / file, model_dir_.path() / file);
+    }
 
-    auto result = load_manager_->LoadModel(model_path.string(), kTestChatTemplateKwargsModelAlias);
+    const auto config_path = model_dir_.path() / "tokenizer_config.json";
+    nlohmann::json config;
+    {
+      std::ifstream input(config_path);
+      input >> config;
+    }
 
-    ASSERT_EQ(result.status, ModelLoadManager::LoadStatus::kSuccess)
-        << "Failed to load test model from: " << model_path;
+    config["chat_template"] =
+        R"({% if enable_thinking is not defined %}[default])"
+        R"({% elif enable_thinking %}[thinking]{% else %}[no-thinking]{% endif %})"
+        R"({% if label is defined %}{{ label }}|{{ count + 1 }}|)"
+        R"({% if nested.enabled %}on{% else %}off{% endif %}|{{ values[1] }}{% endif %})" +
+        config.at("chat_template").get<std::string>();
+    {
+      std::ofstream output(config_path);
+      output << config.dump();
+      output.close();
+      ASSERT_TRUE(output.good()) << "Failed to write tokenizer config: " << config_path;
+    }
 
+    const auto result = load_manager_.LoadModel(model_dir_.string(), "chat-template-kwargs");
+    ASSERT_EQ(result.status, ModelLoadManager::LoadStatus::kSuccess);
     model_ = result.model;
   }
 
-  static void TearDownTestSuite() {
-    if (load_manager_) {
-      load_manager_->UnloadModel(kTestChatTemplateKwargsModelAlias);
+  void TearDown() override {
+    if (model_) {
+      load_manager_.UnloadModel("chat-template-kwargs");
     }
-
-    load_manager_.reset();
-    ep_detector_.reset();
-    model_ = nullptr;
   }
 
   GenAIModelInstance& GetModel() { return *model_; }
 
-  static inline std::unique_ptr<StderrLogger> logger_;
-  static inline std::unique_ptr<test::CpuOnlyEpDetector> ep_detector_;
-  static inline std::unique_ptr<ModelLoadManager> load_manager_;
-  static inline GenAIModelInstance* model_ = nullptr;
+  test::TempPath model_dir_ = test::TempPath::CreateTempDir("fl-chat-template-kwargs-");
+  StderrLogger logger_;
+  test::CpuOnlyEpDetector ep_detector_;
+  ModelLoadManager load_manager_{ep_detector_, logger_};
+  GenAIModelInstance* model_ = nullptr;
 };
 #endif
 
@@ -107,7 +119,7 @@ class ChatTemplateKwargsTest : public ::testing::Test {
 // ---------------------------------------------------------------------------
 
 TEST_F(ChatTemplateTest, SingleUserMessage) {
-  std::vector<MessageItem> messages = {{FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
+  std::vector<TranscriptMessage> messages = {{FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
 
   std::string prompt = BuildChatPrompt(messages, GetModel());
   EXPECT_FALSE(prompt.empty());
@@ -117,7 +129,7 @@ TEST_F(ChatTemplateTest, SingleUserMessage) {
 }
 
 TEST_F(ChatTemplateTest, SystemAndUserMessages) {
-  std::vector<MessageItem> messages = {
+  std::vector<TranscriptMessage> messages = {
       {FOUNDRY_LOCAL_ROLE_SYSTEM, "You are a helpful assistant."},
       {FOUNDRY_LOCAL_ROLE_USER, "What is 2+2?"}};
 
@@ -128,7 +140,7 @@ TEST_F(ChatTemplateTest, SystemAndUserMessages) {
 }
 
 TEST_F(ChatTemplateTest, MultiTurnConversation) {
-  std::vector<MessageItem> messages = {
+  std::vector<TranscriptMessage> messages = {
       {FOUNDRY_LOCAL_ROLE_SYSTEM, "You are a math tutor."},
       {FOUNDRY_LOCAL_ROLE_USER, "What is 2+2?"},
       {FOUNDRY_LOCAL_ROLE_ASSISTANT, "4"},
@@ -149,14 +161,14 @@ TEST(ChatTemplateUnitTest, EmptyAssistantMessageRendersAsEmptyContent) {
 }
 
 TEST_F(ChatTemplateTest, EmptyMessagesThrows) {
-  std::vector<MessageItem> messages;
+  std::vector<TranscriptMessage> messages;
   EXPECT_THROW(BuildChatPrompt(messages, GetModel()), fl::Exception);
 }
 
 TEST_F(ChatTemplateTest, PromptEndsWithAssistantPrefix) {
   // When add_generation_prompt=true, the template should end with the
   // assistant turn prefix so the model continues generating.
-  std::vector<MessageItem> messages = {
+  std::vector<TranscriptMessage> messages = {
       {FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
 
   std::string prompt = BuildChatPrompt(messages, GetModel());
@@ -167,37 +179,43 @@ TEST_F(ChatTemplateTest, PromptEndsWithAssistantPrefix) {
 
 #if FOUNDRY_LOCAL_OGA_HAS_CHAT_TEMPLATE_KWARGS
 TEST_F(ChatTemplateKwargsTest, TypedKwargsChangePromptAndOmissionClearsPriorState) {
-  std::vector<MessageItem> messages = {{FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
+  std::vector<TranscriptMessage> messages = {{FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
   ToolCallContext default_context;
   ToolCallContext thinking_context;
   thinking_context.template_kwargs_json = R"({"enable_thinking":true})";
   ToolCallContext no_thinking_context;
   no_thinking_context.template_kwargs_json = R"({"enable_thinking":false})";
+  ToolCallContext typed_context;
+  typed_context.template_kwargs_json =
+      R"({"enable_thinking":false,"label":"typed","count":2,"nested":{"enabled":false},"values":["one","two"]})";
 
   std::string default_prompt = BuildChatPrompt(messages, GetModel(), default_context);
   std::string thinking_prompt = BuildChatPrompt(messages, GetModel(), thinking_context);
   std::string no_thinking_prompt = BuildChatPrompt(messages, GetModel(), no_thinking_context);
+  std::string typed_prompt = BuildChatPrompt(messages, GetModel(), typed_context);
   std::string default_prompt_after_kwargs =
       BuildChatPrompt(messages, GetModel(), default_context);
 
-  EXPECT_NE(thinking_prompt, no_thinking_prompt)
-      << "ToolCallContext kwargs should reach the prompt path shared by Generator and Engine backends";
+  EXPECT_EQ(default_prompt, "[default][user]Hello![assistant]");
+  EXPECT_EQ(thinking_prompt, "[thinking][user]Hello![assistant]");
+  EXPECT_EQ(no_thinking_prompt, "[no-thinking][user]Hello![assistant]");
+  EXPECT_EQ(typed_prompt, "[no-thinking]typed|3|off|two[user]Hello![assistant]");
   EXPECT_EQ(default_prompt_after_kwargs, default_prompt)
       << "Omitting kwargs must clear tokenizer state from the previous render";
 }
 #else
 TEST_F(ChatTemplateTest, TemplateKwargsRequireSupportedGenAI) {
-  std::vector<MessageItem> messages = {{FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
+  std::vector<TranscriptMessage> messages = {{FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
   ToolCallContext empty_context;
   empty_context.template_kwargs_json = "{}";
 
   EXPECT_EQ(BuildChatPrompt(messages, GetModel(), empty_context),
             BuildChatPrompt(messages, GetModel()))
-      << "An empty kwargs object should remain a no-op with the stable GenAI dependency";
+      << "An empty kwargs object should remain a no-op with an older GenAI dependency";
 
   try {
     (void)BuildChatPrompt(messages, GetModel(), "", R"({"enable_thinking":false})");
-    FAIL() << "Expected chat_template_kwargs to be rejected by the stable GenAI dependency";
+    FAIL() << "Expected chat_template_kwargs to be rejected by an older GenAI dependency";
   } catch (const fl::Exception& e) {
     EXPECT_EQ(e.code(), FOUNDRY_LOCAL_ERROR_INVALID_USAGE);
     EXPECT_NE(std::string(e.what()).find("requires a newer ONNX Runtime GenAI package"),
@@ -211,7 +229,7 @@ TEST_F(ChatTemplateTest, TemplateKwargsRequireSupportedGenAI) {
 // ---------------------------------------------------------------------------
 
 TEST_F(ChatTemplateTest, EncodeProducesTokens) {
-  std::vector<MessageItem> messages = {
+  std::vector<TranscriptMessage> messages = {
       {FOUNDRY_LOCAL_ROLE_USER, "Hello!"}};
 
   std::string prompt = BuildChatPrompt(messages, GetModel());
@@ -223,11 +241,12 @@ TEST_F(ChatTemplateTest, EncodeProducesTokens) {
 }
 
 TEST_F(ChatTemplateTest, LongerMessageProducesMoreTokens) {
-  std::vector<MessageItem> short_msgs = {
+  std::vector<TranscriptMessage> short_msgs = {
       {FOUNDRY_LOCAL_ROLE_USER, "Hi"}};
-  std::vector<MessageItem> long_msgs = {
+  std::vector<TranscriptMessage> long_msgs = {
       {FOUNDRY_LOCAL_ROLE_SYSTEM, "You are a detailed technical writer who explains everything thoroughly."},
-      {FOUNDRY_LOCAL_ROLE_USER, "Explain the theory of relativity in detail, covering both special and general relativity."}};
+      {FOUNDRY_LOCAL_ROLE_USER,
+       "Explain the theory of relativity in detail, covering both special and general relativity."}};
   std::string short_prompt = BuildChatPrompt(short_msgs, GetModel());
   std::string long_prompt = BuildChatPrompt(long_msgs, GetModel());
 
