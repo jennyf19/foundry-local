@@ -132,10 +132,14 @@ nlohmann::ordered_json BuildToolCallsJson(const TranscriptMessage& message) {
   return tool_calls;
 }
 
-nlohmann::ordered_json BuildMessageJson(const TranscriptMessage& message) {
+nlohmann::ordered_json BuildMessageJson(const TranscriptMessage& message, bool preserve_reasoning_history) {
   nlohmann::ordered_json entry;
   entry["role"] = Utils::RoleToString(message.role);
   entry["content"] = message.VisibleText();
+
+  if (preserve_reasoning_history && message.role == FOUNDRY_LOCAL_ROLE_ASSISTANT) {
+    entry["reasoning_content"] = message.ReasoningText();
+  }
 
   for (const auto* call : message.ToolCalls()) {
     if (call->generated_encoding == GeneratedCallEncoding::kRawEnvelope) {
@@ -159,9 +163,6 @@ nlohmann::ordered_json BuildMessageJson(const TranscriptMessage& message) {
     return entry;
   }
 
-  // Reasoning is never projected back into a prompt, not even alongside the calls it produced. It is the model's
-  // private scratchpad: it is typed, stored, and surfaced to the caller, but a conversation replayed from storage
-  // cannot reproduce it, so replaying it here would make a warm session and a rebuilt one send different prompts.
   auto tool_calls = BuildToolCallsJson(message);
   if (!tool_calls.empty()) {
     entry["tool_calls"] = std::move(tool_calls);
@@ -199,10 +200,11 @@ std::string RenderMessageForPrompt(const MessageItem& msg) {
   return text;
 }
 
-std::string BuildChatMessagesJson(const std::vector<TranscriptMessage>& messages) {
+std::string BuildChatMessagesJson(const std::vector<TranscriptMessage>& messages,
+                                  bool preserve_reasoning_history) {
   auto messages_json = nlohmann::ordered_json::array();
   for (const auto& message : messages) {
-    messages_json.push_back(BuildMessageJson(message));
+    messages_json.push_back(BuildMessageJson(message, preserve_reasoning_history));
   }
 
   return messages_json.dump();
@@ -211,21 +213,23 @@ std::string BuildChatMessagesJson(const std::vector<TranscriptMessage>& messages
 std::string BuildChatPrompt(const std::vector<TranscriptMessage>& messages,
                             GenAIModelInstance& model,
                             const std::string& tools_json,
-                            const std::string& template_kwargs_json) {
+            const std::string& template_kwargs_json,
+            bool preserve_reasoning_history) {
   return BuildChatPrompt(
       chat_internal::PrepareChatMessages(messages, model.HasPositionalToolResults()), model, tools_json,
-      template_kwargs_json);
+  template_kwargs_json, preserve_reasoning_history);
 }
 
 std::string BuildChatPrompt(const chat_internal::PreparedChatMessages& messages,
                             GenAIModelInstance& model,
                             const std::string& tools_json,
-                            const std::string& template_kwargs_json) {
+                            const std::string& template_kwargs_json,
+                            bool preserve_reasoning_history) {
   if (messages.Empty()) {
     FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, "messages must not be empty");
   }
 
-  std::string messages_str = BuildChatMessagesJson(messages.Messages());
+  std::string messages_str = BuildChatMessagesJson(messages.Messages(), preserve_reasoning_history);
   const char* tools_ptr = tools_json.empty() ? nullptr : tools_json.c_str();
   const char* template_kwargs_ptr = template_kwargs_json.empty() ? nullptr : template_kwargs_json.c_str();
 
@@ -238,7 +242,15 @@ std::string BuildChatPrompt(const chat_internal::PreparedChatMessages& messages,
 std::string BuildChatPrompt(const std::vector<TranscriptMessage>& messages,
                             GenAIModelInstance& model,
                             const ToolCallContext& tool_ctx) {
-  return BuildChatPrompt(messages, model, tool_ctx.tools_json, tool_ctx.template_kwargs_json);
+  return BuildChatPrompt(messages, model, tool_ctx.tools_json, tool_ctx.template_kwargs_json,
+                         tool_ctx.preserves_reasoning_history);
+}
+
+std::string BuildChatPrompt(const chat_internal::PreparedChatMessages& messages,
+                            GenAIModelInstance& model,
+                            const ToolCallContext& tool_ctx) {
+  return BuildChatPrompt(messages, model, tool_ctx.tools_json, tool_ctx.template_kwargs_json,
+                         tool_ctx.preserves_reasoning_history);
 }
 
 std::unique_ptr<OgaSequences> EncodePrompt(const std::string& prompt,

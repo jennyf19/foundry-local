@@ -874,6 +874,7 @@ ToolCallContext ChatSession::BuildToolCallContext(const Request& request,
   tool_ctx.tool_call_start = GetOptionOrEmpty(options, FOUNDRY_LOCAL_MODEL_PROP_TOOL_CALL_START_STR);
   tool_ctx.tool_call_end = GetOptionOrEmpty(options, FOUNDRY_LOCAL_MODEL_PROP_TOOL_CALL_END_STR);
   tool_ctx.template_kwargs_json = GetOptionOrEmpty(options, "chat_template_kwargs");
+  tool_ctx.preserves_reasoning_history = model_.PreservesReasoningHistory();
 
   // Fall back to model info properties if not specified in the request
   const auto& info = CatalogModel().Info();

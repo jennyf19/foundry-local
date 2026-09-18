@@ -58,6 +58,10 @@ struct ToolCallContext {
   /// Additional typed context values for the model's chat template, serialized as a JSON object.
   std::string template_kwargs_json;
 
+  /// Whether the loaded template has proven that it consumes assistant reasoning_content and honors
+  /// preserve_thinking. Qualified templates receive typed historical reasoning during projection.
+  bool preserves_reasoning_history = false;
+
   /// Kind of each named tool, snapshotted from the session's registry at the same moment
   /// `tools_json` was built. Generation resolves a produced call's name through this copy rather
   /// than through the session's registry, which another thread may change mid-turn.
